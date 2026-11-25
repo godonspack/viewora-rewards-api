@@ -1,9 +1,32 @@
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "https://hoppscotch.io",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type"
+};
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json"
+    }
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+      });
+    }
+
     if (url.pathname === "/") {
-      return Response.json({
+      return json({
         success: true,
         project: "VIEWORA Rewards API",
         status: "online"
@@ -14,41 +37,41 @@ export default {
       try {
         await env.DB.prepare("SELECT 1").first();
 
-        return Response.json({
+        return json({
           success: true,
           worker: "online",
           database: "connected"
         });
       } catch (error) {
-        return Response.json({
+        return json({
           success: false,
           error: "Database connection failed"
-        }, { status: 500 });
+        }, 500);
       }
     }
 
     if (url.pathname === "/test-tbc") {
       if (request.method !== "POST") {
-        return Response.json({
+        return json({
           success: false,
           error: "POST required"
-        }, { status: 405 });
+        }, 405);
       }
 
       const auth = request.headers.get("Authorization");
 
       if (auth !== `Bearer ${env.POSTBACK_SECRET}`) {
-        return Response.json({
+        return json({
           success: false,
           error: "Unauthorized"
-        }, { status: 401 });
+        }, 401);
       }
 
       if (!env.TBC_REWARD_WEBHOOK_URL) {
-        return Response.json({
+        return json({
           success: false,
           error: "TBC webhook not configured"
-        }, { status: 500 });
+        }, 500);
       }
 
       try {
@@ -70,7 +93,7 @@ export default {
           }
         );
 
-        return Response.json({
+        return json({
           success: response.ok,
           tbc_http_status: response.status,
           test_sent: true,
@@ -78,16 +101,16 @@ export default {
         });
 
       } catch (error) {
-        return Response.json({
+        return json({
           success: false,
           error: "TBC connection failed"
-        }, { status: 502 });
+        }, 502);
       }
     }
 
-    return Response.json({
+    return json({
       success: false,
       error: "Endpoint not found"
-    }, { status: 404 });
+    }, 404);
   }
 };
