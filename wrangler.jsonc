@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "viewora-rewards-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-25",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "viewora_rewards",
+      "database_id": "925cfabe-9dd6-40f4-bfeb-0a57bfdee292"
+    }
+  ]
+}
