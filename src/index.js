@@ -87,7 +87,7 @@ if (url.pathname === "/test-tbc" ||
     const testData = {
       source: "VIEWORA_CLOUDFLARE",
       telegram_id: "6694470603",
-      reward_id: "CONTROLLED-" + crypto.randomUUID(),
+      reward_id: "CONTROLLED-f151d684-e1bf-4d2f-82c6-744282753544",
       views: 50,
       reactions: 5,
       internal_secret: env.MINAPP_INTERNAL_SECRET
