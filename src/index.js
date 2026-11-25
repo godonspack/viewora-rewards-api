@@ -316,6 +316,61 @@ export default {
       }
     }
 
+    // TBC CREDIT CONFIRMATION
+if (url.pathname === "/tbc/confirm") {
+  if (request.method !== "POST") {
+    return json({
+      success: false,
+      error: "POST required"
+    }, 405);
+  }
+
+  try {
+    const data = await request.json();
+
+    if (
+      !env.MINAPP_INTERNAL_SECRET ||
+      data.internal_secret !== env.MINAPP_INTERNAL_SECRET
+    ) {
+      return json({
+        success: false,
+        error: "Unauthorized"
+      }, 401);
+    }
+
+    const telegramId = String(data.telegram_id || "");
+    const rewardId = String(data.reward_id || "");
+
+    if (!/^\d+$/.test(telegramId) || !rewardId) {
+      return json({
+        success: false,
+        error: "Invalid confirmation data"
+      }, 400);
+    }
+
+    const result = await env.DB.prepare(`
+      UPDATE rewards
+      SET status = 'credited',
+          credited_at = CURRENT_TIMESTAMP
+      WHERE reward_id = ?
+        AND telegram_id = ?
+        AND status = 'pending'
+    `).bind(rewardId, telegramId).run();
+
+    return json({
+      success: true,
+      confirmed: true,
+      updated: result.meta.changes
+    });
+
+  } catch (error) {
+    return json({
+      success: false,
+      error: "Confirmation processing failed"
+    }, 500);
+  }
+}
+
     return json({
       success: false,
       error: "Endpoint not found"
