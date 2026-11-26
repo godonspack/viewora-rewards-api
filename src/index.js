@@ -343,12 +343,32 @@ async function handleMonetagPostback(request, env, url) {
   }
 
   try {
+    const existing = await env.DB.prepare(`
+      SELECT telegram_id, status
+      FROM rewards
+      WHERE reward_id = ?
+    `).bind(rewardId).first();
+
+    if (existing) {
+      if (existing.telegram_id !== telegramId) {
+        return errorResponse(request, {
+          success: false,
+          error: "Reward ownership mismatch"
+        }, 409);
+      }
+
+      return successResponse(request, {
+        success: true,
+        duplicate: true,
+        status: existing.status,
+        message: "This reward has already been recorded."
+      });
+    }
+
     await ensureWallet(env, telegramId);
 
     const rewardDate = new Date().toISOString().slice(0, 10);
 
-    // D1 batch executes these statements atomically.
-    // changes() ensures a duplicate reward cannot update the wallet.
     await env.DB.batch([
       env.DB.prepare(`
         INSERT OR IGNORE INTO rewards (
@@ -415,13 +435,32 @@ async function handleMonetagPostback(request, env, url) {
       )
     ]);
 
-    const existing = await env.DB.prepare(`
+    const transaction = await env.DB.prepare(`
+      SELECT transaction_id
+      FROM wallet_transactions
+      WHERE transaction_id = ?
+        AND telegram_id = ?
+    `).bind(
+      "MONETAG-" + rewardId,
+      telegramId
+    ).first();
+
+    if (transaction) {
+      return successResponse(request, {
+        success: true,
+        duplicate: false,
+        status: "pending",
+        message: "New estimated reward recorded successfully."
+      });
+    }
+
+    const finalRecord = await env.DB.prepare(`
       SELECT telegram_id, status
       FROM rewards
       WHERE reward_id = ?
     `).bind(rewardId).first();
 
-    if (!existing || existing.telegram_id !== telegramId) {
+    if (finalRecord && finalRecord.telegram_id !== telegramId) {
       return errorResponse(request, {
         success: false,
         error: "Reward ownership mismatch"
@@ -430,10 +469,9 @@ async function handleMonetagPostback(request, env, url) {
 
     return successResponse(request, {
       success: true,
-      status: existing.status,
-      duplicate: existing.status === "pending" &&
-        false,
-      message: "Reward recorded for reconciliation. It is not withdrawable yet."
+      duplicate: true,
+      status: finalRecord?.status || "pending",
+      message: "Reward was already processed."
     });
 
   } catch (error) {
