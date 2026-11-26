@@ -24,19 +24,13 @@ async function deliverReward(env, reward) {
     internal_secret: env.MINAPP_INTERNAL_SECRET
   };
 
-  const response = await fetch(env.TBC_REWARD_WEBHOOK_URL, {
+  return await fetch(env.TBC_REWARD_WEBHOOK_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
     body: JSON.stringify(payload)
   });
-
-  if (!response.ok) {
-    throw new Error("TBC webhook returned HTTP " + response.status);
-  }
-
-  return response.status;
 }
 
 export default {
@@ -58,6 +52,7 @@ export default {
       });
     }
 
+    // HEALTH CHECK
     if (url.pathname === "/health") {
       try {
         await env.DB.prepare("SELECT 1").first();
@@ -75,6 +70,90 @@ export default {
       }
     }
 
+    // TBC CREDIT CONFIRMATION
+    if (url.pathname === "/tbc/confirm") {
+      if (request.method !== "POST") {
+        return json({
+          success: false,
+          error: "POST required"
+        }, 405);
+      }
+
+      try {
+        const data = await request.json();
+
+        if (
+          !env.MINAPP_INTERNAL_SECRET ||
+          data.internal_secret !== env.MINAPP_INTERNAL_SECRET
+        ) {
+          return json({
+            success: false,
+            error: "Unauthorized"
+          }, 401);
+        }
+
+        const telegramId = String(data.telegram_id || "");
+        const rewardId = String(data.reward_id || "");
+
+        if (
+          !/^\d+$/.test(telegramId) ||
+          !/^[A-Za-z0-9_.-]{1,150}$/.test(rewardId)
+        ) {
+          return json({
+            success: false,
+            error: "Invalid confirmation data"
+          }, 400);
+        }
+
+        const result = await env.DB.prepare(`
+          UPDATE rewards
+          SET status = 'credited',
+              credited_at = CURRENT_TIMESTAMP
+          WHERE reward_id = ?
+            AND telegram_id = ?
+            AND status = 'pending'
+        `).bind(rewardId, telegramId).run();
+
+        if (result.meta.changes > 0) {
+          return json({
+            success: true,
+            confirmed: true,
+            updated: result.meta.changes
+          });
+        }
+
+        const existing = await env.DB.prepare(`
+          SELECT status, telegram_id
+          FROM rewards
+          WHERE reward_id = ?
+        `).bind(rewardId).first();
+
+        if (
+          existing &&
+          existing.telegram_id === telegramId &&
+          existing.status === "credited"
+        ) {
+          return json({
+            success: true,
+            confirmed: true,
+            duplicate: true
+          });
+        }
+
+        return json({
+          success: false,
+          confirmed: false,
+          error: "Reward is not pending or does not match"
+        }, 409);
+
+      } catch (error) {
+        return json({
+          success: false,
+          error: "Confirmation processing failed"
+        }, 500);
+      }
+    }
+
     // MONETAG SERVER-TO-SERVER POSTBACK
     if (url.pathname === "/monetag/postback") {
       if (request.method !== "GET") {
@@ -87,7 +166,6 @@ export default {
       try {
         const params = url.searchParams;
 
-        // Verify Monetag postback secret
         if (
           !env.POSTBACK_SECRET ||
           params.get("secret") !== env.POSTBACK_SECRET
@@ -98,7 +176,6 @@ export default {
           }, 401);
         }
 
-        // Only valued ad events qualify
         if (params.get("reward_event_type") !== "valued") {
           return json({
             success: true,
@@ -116,7 +193,6 @@ export default {
           params.get("estimated_price") || 0
         );
 
-        // Validate required values
         if (
           !/^[A-Za-z0-9_.-]{1,150}$/.test(rewardId) ||
           !/^\d+$/.test(telegramId)
@@ -141,8 +217,10 @@ export default {
           }, 400);
         }
 
-        if (!env.TBC_REWARD_WEBHOOK_URL ||
-            !env.MINAPP_INTERNAL_SECRET) {
+        if (
+          !env.TBC_REWARD_WEBHOOK_URL ||
+          !env.MINAPP_INTERNAL_SECRET
+        ) {
           return json({
             success: false,
             error: "Reward delivery is not configured"
@@ -151,7 +229,7 @@ export default {
 
         const rewardDate = new Date().toISOString().slice(0, 10);
 
-        // Record the reward. reward_id is UNIQUE in D1.
+        // Record the reward as pending.
         await env.DB.prepare(`
           INSERT OR IGNORE INTO rewards
           (
@@ -191,11 +269,17 @@ export default {
         if (!existing) {
           return json({
             success: false,
-            error: "Reward record could not be found"
+            error: "Reward record not found"
           }, 500);
         }
 
-        // Do not credit an already credited reward again.
+        if (existing.telegram_id !== telegramId) {
+          return json({
+            success: false,
+            error: "Reward ownership mismatch"
+          }, 409);
+        }
+
         if (existing.status === "credited") {
           return json({
             success: true,
@@ -204,44 +288,50 @@ export default {
           });
         }
 
-        // Prevent a reward ID from being associated with another user.
-        if (existing.telegram_id !== telegramId) {
+        // Only pending rewards are automatically delivered.
+        if (existing.status !== "pending") {
           return json({
             success: false,
-            error: "Reward ID ownership mismatch"
+            status: existing.status,
+            error: "Reward requires reconciliation"
           }, 409);
         }
 
-        // Deliver to the existing VIEWORA wallet.
-        const tbcStatus = await deliverReward(env, {
+        // Send reward to TBC.
+        const tbcResponse = await deliverReward(env, {
           telegram_id: telegramId,
           reward_id: rewardId
         });
 
-        await env.DB.prepare(`
-          UPDATE rewards
-          SET status = 'credited',
-              credited_at = CURRENT_TIMESTAMP
-          WHERE reward_id = ?
-        `).bind(rewardId).run();
+        if (!tbcResponse.ok) {
+          return json({
+            success: false,
+            status: "pending",
+            error: "TBC delivery request failed"
+          }, 502);
+        }
 
-        await env.DB.prepare(`
-          INSERT INTO users
-          (telegram_id, total_earnings, total_views, total_reactions)
-          VALUES (?, 0, 50, 5)
-          ON CONFLICT(telegram_id)
-          DO UPDATE SET
-            total_views = total_views + 50,
-            total_reactions = total_reactions + 5
-        `).bind(telegramId).run();
+        // Check whether TBC actually confirmed the credit.
+        const finalRecord = await env.DB.prepare(`
+          SELECT status
+          FROM rewards
+          WHERE reward_id = ?
+        `).bind(rewardId).first();
+
+        if (finalRecord && finalRecord.status === "credited") {
+          return json({
+            success: true,
+            status: "credited",
+            views: 50,
+            reactions: 5
+          });
+        }
 
         return json({
           success: true,
-          status: "credited",
-          views: 50,
-          reactions: 5,
-          tbc_http_status: tbcStatus
-        });
+          status: "pending",
+          message: "Reward delivered to TBC but confirmation is still pending"
+        }, 202);
 
       } catch (error) {
         return json({
@@ -251,10 +341,11 @@ export default {
       }
     }
 
-    // CONTROLLED TEST ENDPOINTS
-    if (url.pathname === "/test-tbc" ||
-        url.pathname === "/test-reward") {
-
+    // CONTROLLED CONNECTION TEST
+    if (
+      url.pathname === "/test-tbc" ||
+      url.pathname === "/test-reward"
+    ) {
       if (request.method !== "POST") {
         return json({
           success: false,
@@ -269,14 +360,6 @@ export default {
           success: false,
           error: "Unauthorized"
         }, 401);
-      }
-
-      if (!env.TBC_REWARD_WEBHOOK_URL ||
-          !env.MINAPP_INTERNAL_SECRET) {
-        return json({
-          success: false,
-          error: "Reward delivery is not configured"
-        }, 500);
       }
 
       try {
@@ -315,61 +398,6 @@ export default {
         }, 502);
       }
     }
-
-    // TBC CREDIT CONFIRMATION
-if (url.pathname === "/tbc/confirm") {
-  if (request.method !== "POST") {
-    return json({
-      success: false,
-      error: "POST required"
-    }, 405);
-  }
-
-  try {
-    const data = await request.json();
-
-    if (
-      !env.MINAPP_INTERNAL_SECRET ||
-      data.internal_secret !== env.MINAPP_INTERNAL_SECRET
-    ) {
-      return json({
-        success: false,
-        error: "Unauthorized"
-      }, 401);
-    }
-
-    const telegramId = String(data.telegram_id || "");
-    const rewardId = String(data.reward_id || "");
-
-    if (!/^\d+$/.test(telegramId) || !rewardId) {
-      return json({
-        success: false,
-        error: "Invalid confirmation data"
-      }, 400);
-    }
-
-    const result = await env.DB.prepare(`
-      UPDATE rewards
-      SET status = 'credited',
-          credited_at = CURRENT_TIMESTAMP
-      WHERE reward_id = ?
-        AND telegram_id = ?
-        AND status = 'pending'
-    `).bind(rewardId, telegramId).run();
-
-    return json({
-      success: true,
-      confirmed: true,
-      updated: result.meta.changes
-    });
-
-  } catch (error) {
-    return json({
-      success: false,
-      error: "Confirmation processing failed"
-    }, 500);
-  }
-}
 
     return json({
       success: false,
