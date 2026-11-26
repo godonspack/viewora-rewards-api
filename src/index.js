@@ -556,22 +556,6 @@ export default {
       }
     }
 
-    if (url.pathname === "/admin/test-duplicate" &&
-    request.method === "POST") {
-
-  const authorization = request.headers.get("Authorization");
-
-  if (!env.POSTBACK_SECRET ||
-      authorization !== `Bearer ${env.POSTBACK_SECRET}`) {
-    return errorResponse(request, {
-      success: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  return await testDuplicatePostback(env);
-    }
-
     if (url.pathname === "/monetag/postback") {
       return await handleMonetagPostback(request, env, url);
     }
@@ -590,81 +574,3 @@ export default {
     }, 404);
   }
 };
-
-async function testDuplicatePostback(env) {
-  const testTelegramId = "88888888888888888888";
-  const testRewardId = "viewora_duplicate_test_" + crypto.randomUUID();
-
-  const params = new URLSearchParams({
-    secret: env.POSTBACK_SECRET,
-    ymid: testRewardId,
-    event_type: "impression",
-    reward_event_type: "valued",
-    estimated_price: "0.01",
-    zone_id: "12349862",
-    request_var: "viewora_earn",
-    telegram_id: testTelegramId
-  });
-
-  const testUrl =
-    "https://viewora-rewards-api.godwinjohn451.workers.dev/monetag/postback?" +
-    params.toString();
-
-  const request = () => new Request(testUrl, {
-    method: "GET",
-    headers: {
-      Origin: "https://viewora-miniapp.pages.dev"
-    }
-  });
-
-  try {
-    const firstResponse = await handleMonetagPostback(
-      request(),
-      env,
-      new URL(testUrl)
-    );
-
-    const firstResult = await firstResponse.json();
-
-    const secondResponse = await handleMonetagPostback(
-      request(),
-      env,
-      new URL(testUrl)
-    );
-
-    const secondResult = await secondResponse.json();
-
-    return new Response(JSON.stringify({
-      success: true,
-      test: "duplicate_postback",
-      first_postback: {
-        http_status: firstResponse.status,
-        result: firstResult
-      },
-      second_postback: {
-        http_status: secondResponse.status,
-        result: secondResult
-      },
-      test_telegram_id: testTelegramId,
-      test_reward_id: testRewardId
-    }), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        ...corsHeaders(request())
-      }
-    });
-
-  } catch (error) {
-    return new Response(JSON.stringify({
-      success: false,
-      error: "Duplicate test failed"
-    }), {
-      status: 500,
-      headers: {
-        "Content-Type": "application/json"
-      }
-    });
-  }
-}
-
