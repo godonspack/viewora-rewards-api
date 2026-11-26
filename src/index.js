@@ -96,24 +96,17 @@ function constantTimeEqual(a, b) {
   return result === 0;
 }
 
-// Verify Telegram Mini App initData.
 async function authenticateTelegram(request, env) {
   try {
-    if (!env.TELEGRAM_BOT_TOKEN) {
-      return null;
-    }
+    if (!env.TELEGRAM_BOT_TOKEN) return null;
 
     const authorization = request.headers.get("Authorization") || "";
 
-    if (!authorization.startsWith("tma ")) {
-      return null;
-    }
+    if (!authorization.startsWith("tma ")) return null;
 
     const initData = authorization.slice(4);
 
-    if (!initData || initData.length > 10000) {
-      return null;
-    }
+    if (!initData || initData.length > 10000) return null;
 
     const params = new URLSearchParams(initData);
     const receivedHash = params.get("hash");
@@ -125,11 +118,12 @@ async function authenticateTelegram(request, env) {
     params.delete("hash");
 
     const authDate = Number(params.get("auth_date"));
+    const now = Math.floor(Date.now() / 1000);
 
     if (
       !Number.isFinite(authDate) ||
-      authDate > Math.floor(Date.now() / 1000) + 60 ||
-      Math.floor(Date.now() / 1000) - authDate > 86400
+      authDate > now + 60 ||
+      now - authDate > 86400
     ) {
       return null;
     }
@@ -154,22 +148,18 @@ async function authenticateTelegram(request, env) {
 
     const userString = params.get("user");
 
-    if (!userString) {
-      return null;
-    }
+    if (!userString) return null;
 
     const user = JSON.parse(userString);
 
-    if (!validTelegramId(user.id)) {
-      return null;
-    }
+    if (!validTelegramId(user.id)) return null;
 
     return {
       telegram_id: String(user.id),
       first_name: String(user.first_name || "")
     };
 
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -242,6 +232,7 @@ async function handleTransactions(request, env, url) {
   }
 
   const requestedLimit = Number(url.searchParams.get("limit") || 20);
+
   const limit = Math.max(
     1,
     Math.min(Number.isFinite(requestedLimit) ? requestedLimit : 20, 50)
@@ -279,8 +270,45 @@ async function handleTransactions(request, env, url) {
   });
 }
 
+async function getRevenueConfig(env) {
+  const result = await env.DB.prepare(`
+    SELECT config_key, config_value
+    FROM platform_config
+    WHERE config_key IN (
+      'user_share_percent',
+      'platform_share_percent',
+      'rewards_enabled'
+    )
+  `).all();
+
+  const config = {};
+
+  for (const row of result.results || []) {
+    config[row.config_key] = row.config_value;
+  }
+
+  const userShare = Number(config.user_share_percent);
+  const platformShare = Number(config.platform_share_percent);
+
+  if (
+    config.rewards_enabled !== "1" ||
+    !Number.isFinite(userShare) ||
+    !Number.isFinite(platformShare) ||
+    userShare <= 0 ||
+    platformShare < 0 ||
+    userShare + platformShare !== 100
+  ) {
+    return null;
+  }
+
+  return {
+    userShare,
+    platformShare
+  };
+}
+
 // Monetag server-to-server postback.
-// Estimated revenue is recorded as PENDING only.
+// Only verified valued events are eligible for immediate credit.
 async function handleMonetagPostback(request, env, url) {
   if (request.method !== "GET") {
     return errorResponse(request, {
@@ -314,9 +342,7 @@ async function handleMonetagPostback(request, env, url) {
   const zoneId = params.get("zone_id") || "";
   const requestVar = params.get("request_var") || "";
   const eventType = params.get("event_type") || "";
-  const estimatedPrice = Number(
-    params.get("estimated_price") || 0
-  );
+  const estimatedPrice = params.get("estimated_price") || "";
 
   if (
     !validRewardId(rewardId) ||
@@ -338,9 +364,9 @@ async function handleMonetagPostback(request, env, url) {
     }, 400);
   }
 
-  const amountMicros = dollarsToMicros(estimatedPrice);
+  const grossMicros = dollarsToMicros(estimatedPrice);
 
-  if (!amountMicros) {
+  if (!grossMicros) {
     return errorResponse(request, {
       success: false,
       error: "Invalid estimated reward amount"
@@ -348,16 +374,39 @@ async function handleMonetagPostback(request, env, url) {
   }
 
   try {
-    await ensureWallet(env, telegramId);
+    const config = await getRevenueConfig(env);
+
+    if (!config) {
+      return errorResponse(request, {
+        success: false,
+        error: "Rewards are disabled or revenue configuration is invalid"
+      }, 503);
+    }
+
+    const userRewardMicros = Math.round(
+      grossMicros * config.userShare / 100
+    );
+
+    const platformShareMicros = grossMicros - userRewardMicros;
+
+    if (userRewardMicros <= 0) {
+      return errorResponse(request, {
+        success: false,
+        error: "Reward amount is too small"
+      }, 400);
+    }
 
     const rewardDate = new Date().toISOString().slice(0, 10);
+    const transactionId = "MONETAG-" + rewardId;
 
-    // All three operations execute atomically.
-    // A duplicate reward cannot update the wallet.
+    await ensureWallet(env, telegramId);
+
+    // Every balance-changing operation is gated by changes().
+    // D1 batch is atomic: a failed statement rolls back the batch.
 
     const results = await env.DB.batch([
 
-      // 1. Insert the unique Monetag reward.
+      // 1. Insert unique Monetag reward.
       env.DB.prepare(`
         INSERT OR IGNORE INTO rewards (
           telegram_id,
@@ -372,9 +421,7 @@ async function handleMonetagPostback(request, env, url) {
           zone_id,
           request_var
         )
-        VALUES (
-          ?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, ?
-        )
+        VALUES (?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, ?)
       `).bind(
         telegramId,
         rewardId,
@@ -386,20 +433,50 @@ async function handleMonetagPostback(request, env, url) {
         requestVar
       ),
 
-      // 2. Increase pending balance only if step 1 inserted.
+      // 2. Insert the internal revenue ledger entry.
+      // Only if the reward was newly inserted.
+      env.DB.prepare(`
+        INSERT OR IGNORE INTO monetag_reward_ledger (
+          reward_id,
+          telegram_id,
+          gross_estimate_micros,
+          user_reward_micros,
+          platform_share_micros,
+          user_share_percent,
+          platform_share_percent,
+          status
+        )
+        SELECT
+          ?, ?, ?, ?, ?, ?, ?, 'credited'
+        WHERE changes() > 0
+      `).bind(
+        rewardId,
+        telegramId,
+        grossMicros,
+        userRewardMicros,
+        platformShareMicros,
+        config.userShare,
+        config.platformShare
+      ),
+
+      // 3. Credit available wallet balance.
+      // Only if the ledger was newly inserted.
       env.DB.prepare(`
         UPDATE wallets
         SET
-          pending_micros = pending_micros + ?,
+          available_micros = available_micros + ?,
+          lifetime_earned_micros = lifetime_earned_micros + ?,
           updated_at = CURRENT_TIMESTAMP
         WHERE telegram_id = ?
           AND changes() > 0
       `).bind(
-        amountMicros,
+        userRewardMicros,
+        userRewardMicros,
         telegramId
       ),
 
-      // 3. Create transaction only if step 2 updated a wallet.
+      // 4. Insert completed wallet transaction.
+      // Only if the wallet was updated.
       env.DB.prepare(`
         INSERT INTO wallet_transactions (
           telegram_id,
@@ -418,35 +495,51 @@ async function handleMonetagPostback(request, env, url) {
           'earning',
           'monetag',
           ?,
-          'pending',
-          'pending',
-          'Estimated Monetag reward awaiting revenue reconciliation',
+          'available',
+          'completed',
+          'Monetag valued reward',
           ?
         WHERE changes() > 0
       `).bind(
         telegramId,
-        "MONETAG-" + rewardId,
-        amountMicros,
+        transactionId,
+        userRewardMicros,
         rewardId
+      ),
+
+      // 5. Mark reward as credited.
+      // Only if the transaction was inserted.
+      env.DB.prepare(`
+        UPDATE rewards
+        SET
+          status = 'credited',
+          credited_at = CURRENT_TIMESTAMP
+        WHERE reward_id = ?
+          AND telegram_id = ?
+          AND changes() > 0
+      `).bind(
+        rewardId,
+        telegramId
       )
 
     ]);
 
-    // Check the actual database insertion result.
-    const inserted = Number(
-      results[0]?.meta?.changes || 0
-    );
+    const inserted = Number(results[0]?.meta?.changes || 0);
 
     if (inserted === 1) {
       return successResponse(request, {
         success: true,
         duplicate: false,
-        status: "pending",
-        message: "New estimated reward recorded successfully."
+        status: "credited",
+        currency: "USD",
+        gross_estimate: microsToDollars(grossMicros),
+        user_reward: microsToDollars(userRewardMicros),
+        platform_share: microsToDollars(platformShareMicros),
+        message: "Reward credited successfully."
       });
     }
 
-    // The reward already existed.
+    // Duplicate reward: verify ownership.
     const existing = await env.DB.prepare(`
       SELECT telegram_id, status
       FROM rewards
@@ -471,13 +564,15 @@ async function handleMonetagPostback(request, env, url) {
       success: true,
       duplicate: true,
       status: existing.status,
-      message: "This reward was already recorded. No additional balance was added."
+      message: "Reward already processed. No additional credit was added."
     });
 
   } catch (error) {
+    console.error("Monetag postback processing failed:", error);
+
     return errorResponse(request, {
       success: false,
-      error: "Reward recording failed"
+      error: "Reward processing failed"
     }, 500);
   }
 }
@@ -512,7 +607,7 @@ export default {
           wallet_system: "enabled"
         });
 
-      } catch (error) {
+      } catch {
         return errorResponse(request, {
           success: false,
           error: "Database connection failed"
@@ -531,6 +626,8 @@ export default {
       try {
         return await handleWallet(request, env);
       } catch (error) {
+        console.error("Wallet request failed:", error);
+
         return errorResponse(request, {
           success: false,
           error: "Wallet request failed"
@@ -549,6 +646,8 @@ export default {
       try {
         return await handleTransactions(request, env, url);
       } catch (error) {
+        console.error("Transaction request failed:", error);
+
         return errorResponse(request, {
           success: false,
           error: "Transaction request failed"
@@ -560,7 +659,6 @@ export default {
       return await handleMonetagPostback(request, env, url);
     }
 
-    // Old SMM confirmation endpoint intentionally retired.
     if (url.pathname === "/tbc/confirm") {
       return errorResponse(request, {
         success: false,
