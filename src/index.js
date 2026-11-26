@@ -314,9 +314,14 @@ async function handleMonetagPostback(request, env, url) {
   const zoneId = params.get("zone_id") || "";
   const requestVar = params.get("request_var") || "";
   const eventType = params.get("event_type") || "";
-  const estimatedPrice = Number(params.get("estimated_price") || 0);
+  const estimatedPrice = Number(
+    params.get("estimated_price") || 0
+  );
 
-  if (!validRewardId(rewardId) || !validTelegramId(telegramId)) {
+  if (
+    !validRewardId(rewardId) ||
+    !validTelegramId(telegramId)
+  ) {
     return errorResponse(request, {
       success: false,
       error: "Invalid reward or Telegram ID"
@@ -343,33 +348,16 @@ async function handleMonetagPostback(request, env, url) {
   }
 
   try {
-    const existing = await env.DB.prepare(`
-      SELECT telegram_id, status
-      FROM rewards
-      WHERE reward_id = ?
-    `).bind(rewardId).first();
-
-    if (existing) {
-      if (existing.telegram_id !== telegramId) {
-        return errorResponse(request, {
-          success: false,
-          error: "Reward ownership mismatch"
-        }, 409);
-      }
-
-      return successResponse(request, {
-        success: true,
-        duplicate: true,
-        status: existing.status,
-        message: "This reward has already been recorded."
-      });
-    }
-
     await ensureWallet(env, telegramId);
 
     const rewardDate = new Date().toISOString().slice(0, 10);
 
-    await env.DB.batch([
+    // All three operations execute atomically.
+    // A duplicate reward cannot update the wallet.
+
+    const results = await env.DB.batch([
+
+      // 1. Insert the unique Monetag reward.
       env.DB.prepare(`
         INSERT OR IGNORE INTO rewards (
           telegram_id,
@@ -384,7 +372,9 @@ async function handleMonetagPostback(request, env, url) {
           zone_id,
           request_var
         )
-        VALUES (?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, ?)
+        VALUES (
+          ?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, ?
+        )
       `).bind(
         telegramId,
         rewardId,
@@ -396,14 +386,20 @@ async function handleMonetagPostback(request, env, url) {
         requestVar
       ),
 
+      // 2. Increase pending balance only if step 1 inserted.
       env.DB.prepare(`
         UPDATE wallets
-        SET pending_micros = pending_micros + ?,
-            updated_at = CURRENT_TIMESTAMP
+        SET
+          pending_micros = pending_micros + ?,
+          updated_at = CURRENT_TIMESTAMP
         WHERE telegram_id = ?
           AND changes() > 0
-      `).bind(amountMicros, telegramId),
+      `).bind(
+        amountMicros,
+        telegramId
+      ),
 
+      // 3. Create transaction only if step 2 updated a wallet.
       env.DB.prepare(`
         INSERT INTO wallet_transactions (
           telegram_id,
@@ -433,19 +429,15 @@ async function handleMonetagPostback(request, env, url) {
         amountMicros,
         rewardId
       )
+
     ]);
 
-    const transaction = await env.DB.prepare(`
-      SELECT transaction_id
-      FROM wallet_transactions
-      WHERE transaction_id = ?
-        AND telegram_id = ?
-    `).bind(
-      "MONETAG-" + rewardId,
-      telegramId
-    ).first();
+    // Check the actual database insertion result.
+    const inserted = Number(
+      results[0]?.meta?.changes || 0
+    );
 
-    if (transaction) {
+    if (inserted === 1) {
       return successResponse(request, {
         success: true,
         duplicate: false,
@@ -454,13 +446,21 @@ async function handleMonetagPostback(request, env, url) {
       });
     }
 
-    const finalRecord = await env.DB.prepare(`
+    // The reward already existed.
+    const existing = await env.DB.prepare(`
       SELECT telegram_id, status
       FROM rewards
       WHERE reward_id = ?
     `).bind(rewardId).first();
 
-    if (finalRecord && finalRecord.telegram_id !== telegramId) {
+    if (!existing) {
+      return errorResponse(request, {
+        success: false,
+        error: "Reward record could not be verified"
+      }, 500);
+    }
+
+    if (existing.telegram_id !== telegramId) {
       return errorResponse(request, {
         success: false,
         error: "Reward ownership mismatch"
@@ -470,8 +470,8 @@ async function handleMonetagPostback(request, env, url) {
     return successResponse(request, {
       success: true,
       duplicate: true,
-      status: finalRecord?.status || "pending",
-      message: "Reward was already processed."
+      status: existing.status,
+      message: "This reward was already recorded. No additional balance was added."
     });
 
   } catch (error) {
