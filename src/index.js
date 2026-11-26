@@ -577,6 +577,157 @@ async function handleMonetagPostback(request, env, url) {
   }
 }
 
+async function handleDuplicateRewardTest(request, env) {
+if (request.method !== "POST") {
+return json({ success: false, error: "POST required" }, 405);
+}
+
+const suppliedSecret = request.headers.get("X-Viewora-Test-Secret") || "";
+
+if (
+!env.MINAPP_INTERNAL_SECRET ||
+!constantTimeEqual(suppliedSecret, env.MINAPP_INTERNAL_SECRET)
+) {
+return json({ success: false, error: "Unauthorized" }, 401);
+}
+
+if (!env.POSTBACK_SECRET) {
+return json({ success: false, error: "Postback secret is missing" }, 503);
+}
+
+const randomDigits = Array.from(
+crypto.getRandomValues(new Uint8Array(17)),
+byte => String(byte % 10)
+).join("");
+
+const testTelegramId = "99" + randomDigits;
+const testRewardId = "VIEWORA-DUPTEST-" + crypto.randomUUID();
+
+let testWalletCreated = false;
+
+try {
+const existingWallet = await env.DB.prepare("SELECT telegram_id FROM wallets WHERE telegram_id = ?").bind(testTelegramId).first();
+
+if (existingWallet) {
+  throw new Error("Synthetic test account collision");
+}
+
+await ensureWallet(env, testTelegramId);
+testWalletCreated = true;
+
+const testUrl = new URL("https://internal.test/monetag/postback");
+
+testUrl.searchParams.set("secret", env.POSTBACK_SECRET);
+testUrl.searchParams.set("ymid", testRewardId);
+testUrl.searchParams.set("event_type", "impression");
+testUrl.searchParams.set("reward_event_type", "valued");
+testUrl.searchParams.set("estimated_price", "0.10");
+testUrl.searchParams.set("zone_id", MONETAG_ZONE_ID);
+testUrl.searchParams.set("request_var", MONETAG_REQUEST_VAR);
+testUrl.searchParams.set("telegram_id", testTelegramId);
+
+const firstResponse = await handleMonetagPostback(
+  new Request(testUrl.toString()),
+  env,
+  testUrl
+);
+
+const firstResult = await firstResponse.json();
+
+const secondResponse = await handleMonetagPostback(
+  new Request(testUrl.toString()),
+  env,
+  testUrl
+);
+
+const secondResult = await secondResponse.json();
+
+const wallet = await env.DB.prepare(`
+  SELECT available_micros, lifetime_earned_micros
+  FROM wallets
+  WHERE telegram_id = ?
+`).bind(testTelegramId).first();
+
+const ledger = await env.DB.prepare(`
+  SELECT COUNT(*) AS total
+  FROM monetag_reward_ledger
+  WHERE reward_id = ?
+`).bind(testRewardId).first();
+
+const transactions = await env.DB.prepare(`
+  SELECT COUNT(*) AS total
+  FROM wallet_transactions
+  WHERE telegram_id = ? AND reference_id = ?
+`).bind(testTelegramId, testRewardId).first();
+
+const reward = await env.DB.prepare(`
+  SELECT COUNT(*) AS total, MAX(status) AS status
+  FROM rewards
+  WHERE reward_id = ? AND telegram_id = ?
+`).bind(testRewardId, testTelegramId).first();
+
+const expectedReward = 40000;
+
+const passed =
+  firstResult.success === true &&
+  firstResult.duplicate === false &&
+  secondResult.success === true &&
+  secondResult.duplicate === true &&
+  Number(wallet?.available_micros) === expectedReward &&
+  Number(wallet?.lifetime_earned_micros) === expectedReward &&
+  Number(ledger?.total) === 1 &&
+  Number(transactions?.total) === 1 &&
+  Number(reward?.total) === 1 &&
+  reward?.status === "credited";
+
+return json({
+  success: true,
+  test: passed ? "PASSED" : "FAILED",
+  first_submission: firstResult,
+  second_submission: secondResult,
+  checks: {
+    wallet_credit_micros: Number(wallet?.available_micros || 0),
+    expected_wallet_credit_micros: expectedReward,
+    ledger_entries: Number(ledger?.total || 0),
+    wallet_transactions: Number(transactions?.total || 0),
+    reward_records: Number(reward?.total || 0),
+    reward_status: reward?.status || null
+  },
+  test_records: "Will be cleaned up automatically"
+});
+
+} catch (error) {
+console.error("Duplicate reward test failed:", error);
+
+return json({
+  success: false,
+  test: "ERROR",
+  error: "The duplicate-reward test could not be completed."
+}, 500);
+
+} finally {
+if (testWalletCreated) {
+await env.DB.batch([
+env.DB.prepare("DELETE FROM wallet_transactions WHERE telegram_id = ? AND reference_id = ?").bind(testTelegramId, testRewardId),
+
+    env.DB.prepare(`
+      DELETE FROM monetag_reward_ledger
+      WHERE reward_id = ? AND telegram_id = ?
+    `).bind(testRewardId, testTelegramId),
+
+    env.DB.prepare(`
+      DELETE FROM rewards
+      WHERE reward_id = ? AND telegram_id = ?
+    `).bind(testRewardId, testTelegramId),
+
+    env.DB.prepare(`
+      DELETE FROM wallets
+      WHERE telegram_id = ?
+    `).bind(testTelegramId)
+  ]);
+}
+}}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -653,6 +804,10 @@ export default {
           error: "Transaction request failed"
         }, 500);
       }
+    }
+
+    if (url.pathname === "/admin/test-duplicate") {
+  return await handleDuplicateRewardTest(request, env);
     }
 
     if (url.pathname === "/monetag/postback") {
