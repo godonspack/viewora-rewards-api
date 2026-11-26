@@ -80,7 +80,15 @@ export default {
       }
 
       try {
-        const data = await request.json();
+        const contentType = request.headers.get("Content-Type") || "";
+let data;
+
+if (contentType.includes("application/json")) {
+  data = await request.json();
+} else {
+  const form = await request.formData();
+  data = Object.fromEntries(form.entries());
+}
 
         if (
           !env.MINAPP_INTERNAL_SECRET ||
