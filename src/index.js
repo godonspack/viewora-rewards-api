@@ -15,7 +15,7 @@ function corsHeaders(request) {
   return {
     "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Viewora-Test-Secret",
     "Vary": "Origin"
   };
 }
